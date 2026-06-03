@@ -1,4 +1,4 @@
-package zone.rong.bansoukou.test;
+package zone.rong.bansoukou;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
