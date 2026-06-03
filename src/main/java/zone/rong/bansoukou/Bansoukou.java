@@ -6,7 +6,9 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.*;
+import java.nio.file.attribute.FileTime;
 import java.util.*;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
@@ -14,14 +16,27 @@ import java.util.zip.ZipFile;
 
 public class Bansoukou {
 
-    public static final File HOME = (File) FMLInjectionData.data()[6];
     public static final Logger LOGGER = LogManager.getLogger(Tags.MOD_NAME);
 
-    private static final Path HOME_PATH = HOME.toPath();
-    public static final Path BANSOUKOU_DIRECTORY = HOME_PATH.resolve(Tags.MOD_ID);
-    public static final Path CACHE_BANSOUKOU_DIRECTORY = HOME_PATH.resolve("cache").resolve(Tags.MOD_ID);
+    public static final File HOME;
+    public static final Path BANSOUKOU_DIRECTORY;
+    public static final Path CACHE_BANSOUKOU_DIRECTORY;
+    private static final Path MOD_DIRECTORY;
 
-    private static final Path MOD_DIRECTORY = HOME_PATH.resolve("mods");
+    static {
+        File home = new File(".");
+        try {
+            Object[] data = FMLInjectionData.data();
+            if (data[6] != null) {
+                home = (File) data[6];
+            }
+        } catch (Throwable ignored) { }
+        HOME = home;
+        Path homePath = home.toPath();
+        BANSOUKOU_DIRECTORY = homePath.resolve(Tags.MOD_ID);
+        CACHE_BANSOUKOU_DIRECTORY = homePath.resolve("cache").resolve(Tags.MOD_ID);
+        MOD_DIRECTORY = homePath.resolve("mods");
+    }
 
     public static Map<Path, Path> init() {
         if (!Files.exists(BANSOUKOU_DIRECTORY) || !Files.isDirectory(BANSOUKOU_DIRECTORY)) {
@@ -32,14 +47,38 @@ public class Bansoukou {
         }
     }
 
-    private static boolean needsPatching(Path patchJar, Path cacheJar) throws IOException {
+    static boolean needsPatching(Path patchSource, Path cacheJar) throws IOException {
         if (!Files.exists(cacheJar)) {
             return true;
         }
-        return Files.getLastModifiedTime(patchJar).compareTo(Files.getLastModifiedTime(cacheJar)) > 0;
+        FileTime cacheTime = Files.getLastModifiedTime(cacheJar);
+        if (Files.isDirectory(patchSource)) {
+            try (Stream<Path> walk = Files.walk(patchSource)) {
+                return walk.filter(Files::isRegularFile).anyMatch(path -> {
+                    try {
+                        return Files.getLastModifiedTime(path).compareTo(cacheTime) > 0;
+                    } catch (IOException e) {
+                        throw new RuntimeException("Failed to read modified time of " + path, e);
+                    }
+                });
+            }
+        }
+        return Files.getLastModifiedTime(patchSource).compareTo(cacheTime) > 0;
     }
 
-    private static void patchJar(Path originalJar, Path patchJar, Path cacheJar) throws IOException {
+    private static String resolveModFileName(String bareName) {
+        String jarName = bareName + ".jar";
+        if (Files.exists(MOD_DIRECTORY.resolve(jarName))) {
+            return jarName;
+        }
+        String zipName = bareName + ".zip";
+        if (Files.exists(MOD_DIRECTORY.resolve(zipName))) {
+            return zipName;
+        }
+        return null;
+    }
+
+    static void patchJar(Path originalJar, Path patchSource, Path cacheJar) throws IOException {
         Files.copy(originalJar, cacheJar, StandardCopyOption.REPLACE_EXISTING);
 
         // Remove signature-related files
@@ -62,24 +101,58 @@ public class Bansoukou {
         }
 
         // Patch over files
-        try (ZipFile patchZipFile = new ZipFile(patchJar.toFile());
-             FileSystem jarFs = FileSystems.newFileSystem(cacheJar, null)) {
+        try (FileSystem jarFs = FileSystems.newFileSystem(cacheJar, null)) {
+            if (Files.isDirectory(patchSource)) {
+                patchFromDirectory(patchSource, jarFs);
+            } else {
+                patchFromZip(patchSource, jarFs);
+            }
+        }
+    }
+
+    @FunctionalInterface
+    interface IOSupplier {
+
+        InputStream get() throws IOException;
+
+    }
+
+    // Applies one patch entry to the cached jar: empty entry deletes the target, otherwise overwrites it.
+    private static void applyPatchEntry(FileSystem jarFs, String entryName, boolean empty, IOSupplier content) throws IOException {
+        Path targetPath = jarFs.getPath(entryName);
+        if (targetPath.getParent() != null) {
+            Files.createDirectories(targetPath.getParent());
+        }
+        if (empty) {
+            LOGGER.debug("Deleting {} as it is empty in the patch.", targetPath);
+            Files.deleteIfExists(targetPath);
+        } else {
+            LOGGER.debug("Patching {}.", targetPath);
+            try (InputStream in = content.get()) {
+                Files.copy(in, targetPath, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+    }
+
+    private static void patchFromZip(Path patchJar, FileSystem jarFs) throws IOException {
+        try (ZipFile patchZipFile = new ZipFile(patchJar.toFile())) {
             Enumeration<? extends ZipEntry> entries = patchZipFile.entries();
             while (entries.hasMoreElements()) {
                 ZipEntry entry = entries.nextElement();
                 if (!entry.isDirectory()) {
-                    Path targetPath = jarFs.getPath(entry.getName());
-                    if (targetPath.getParent() != null) {
-                        Files.createDirectories(targetPath.getParent());
-                    }
-                    if (entry.getSize() == 0L) {
-                        LOGGER.debug("Deleting {} as it is empty in the patch.", targetPath);
-                        Files.delete(targetPath);
-                    } else {
-                        LOGGER.debug("Patching {}.", targetPath);
-                        Files.copy(patchZipFile.getInputStream(entry), targetPath, StandardCopyOption.REPLACE_EXISTING);
-                    }
+                    applyPatchEntry(jarFs, entry.getName(), entry.getSize() == 0L, () -> patchZipFile.getInputStream(entry));
                 }
+            }
+        }
+    }
+
+    private static void patchFromDirectory(Path patchDir, FileSystem jarFs) throws IOException {
+        try (Stream<Path> walk = Files.walk(patchDir)) {
+            Iterator<Path> sources = walk.filter(Files::isRegularFile).iterator();
+            while (sources.hasNext()) {
+                Path source = sources.next();
+                String relative = patchDir.relativize(source).toString().replace(File.separatorChar, '/');
+                applyPatchEntry(jarFs, relative, Files.size(source) == 0L, () -> Files.newInputStream(source));
             }
         }
     }
@@ -96,13 +169,18 @@ public class Bansoukou {
         Map<Path, Path> patch = new HashMap<>();
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(BANSOUKOU_DIRECTORY)) {
             for (Path patchFile : stream) {
+                String fileName = patchFile.getFileName().toString();
+                String patchName; // target mod file name, with extension
                 if (Files.isDirectory(patchFile)) {
-                    LOGGER.error("{} is a directory! Unlike Bansoukou v4 and before, your patches should be zipped up in a jar file. If the mod you are patching is a zip file, ", patchFile);
-                    continue;
-                }
-                String patchName = patchFile.getFileName().toString();
-                if (!(patchName.endsWith(".jar") || patchName.endsWith("zip"))) {
-                    LOGGER.error("{} is not a .jar or .zip file, skipping.", patchName);
+                    patchName = resolveModFileName(fileName);
+                    if (patchName == null) {
+                        LOGGER.error("No .jar/.zip in mods/ matches patch directory {}, skipping.", fileName);
+                        continue;
+                    }
+                } else if (fileName.endsWith(".jar") || fileName.endsWith(".zip")) {
+                    patchName = fileName;
+                } else {
+                    LOGGER.error("{} is not a .jar/.zip file or directory named after the target mod, skipping.", fileName);
                     continue;
                 }
                 Path originalJar = MOD_DIRECTORY.resolve(patchName);
